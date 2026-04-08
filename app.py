@@ -12,6 +12,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
 import time
 import hashlib
+import copy
 from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
@@ -40,10 +41,9 @@ class MLP(nn.Module):
         x = F.relu(self.fc2(x))
         return self.out(x)
 
-def train_model(model, X_t, y_t, epochs=25, batch_size=32, lr=0.005):
+def train_model(model, X_t, y_t, epochs=10, batch_size=32, lr=0.005):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     loader = DataLoader(TensorDataset(X_t, y_t), batch_size=batch_size, shuffle=True)
-    
     for epoch in range(epochs):
         for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
@@ -64,79 +64,94 @@ def extract_features(model, X_t):
             feats.append(x.cpu().numpy())
     return np.vstack(feats)
 
-@st.cache_resource(show_spinner=False)
-def load_and_preprocess_data():
-    url = "https://raw.githubusercontent.com/jbrownlee/Datasets/master/pima-indians-diabetes.data.csv"
-    df = pd.read_csv(url, header=None)
-    df.columns = ["Pregnancies","Glucose","BloodPressure","SkinThickness",
-                  "Insulin","BMI","DiabetesPedigree","Age","Outcome"]
-                  
-    patient_ids = ["P-" + str(1000 + i) for i in range(len(df))]
-    
-    X = df.drop(["Outcome"], axis=1).values
-    y = df["Outcome"].values
-    
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    X_t = torch.tensor(X_scaled, dtype=torch.float32)
-    y_t = torch.tensor(y, dtype=torch.long)
-    
-    return X_t, y_t, list(df.columns[:-1]), patient_ids, ["Negative", "Diabetic"], X_scaled, df, scaler
-
-def train_full_model_time(X_t, y_t):
-    m = MLP().to(device)
-    t0 = time.time()
-    train_model(m, X_t, y_t, epochs=25)
-    return time.time() - t0
-
 def get_model_fingerprint(model):
     cache = [param.data.cpu().numpy().tobytes() for param in model.parameters()]
     return hashlib.sha256(b"".join(cache)).hexdigest()[:12]
 
-def init_sisa_clusters(X_t, y_t, patient_ids):
-    start_time = time.time()
-    
-    # 1. Base Model training
+# ============================
+# CACHED HEAVY LIFTING
+# Everything expensive runs ONCE and is cached.
+# ============================
+@st.cache_resource(show_spinner="Compiling ADISA Engine (runs once, then cached)...")
+def build_engine():
+    seed_everything()
+
+    # --- Load PIMA dataset ---
+    url = "https://raw.githubusercontent.com/jbrownlee/Datasets/master/pima-indians-diabetes.data.csv"
+    df = pd.read_csv(url, header=None)
+    df.columns = ["Pregnancies","Glucose","BloodPressure","SkinThickness",
+                  "Insulin","BMI","DiabetesPedigree","Age","Outcome"]
+
+    patient_ids = ["P-" + str(1000 + i) for i in range(len(df))]
+
+    X = df.drop(["Outcome"], axis=1).values
+    y = df["Outcome"].values
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    X_t = torch.tensor(X_scaled, dtype=torch.float32)
+    y_t = torch.tensor(y, dtype=torch.long)
+
+    feature_names = list(df.columns[:-1])
+    target_names = ["Negative", "Diabetic"]
+
+    # --- Train Base Model ---
     base_model = MLP().to(device)
-    base_model = train_model(base_model, X_t, y_t, epochs=15)
-    
-    # 2. Extract latent attributes for KMeans
+    base_model = train_model(base_model, X_t, y_t, epochs=10)
+
+    # --- Latent Feature Extraction + KMeans ---
     latent_feats = extract_features(base_model, X_t)
-    
-    # 3. K-Means Clustering dynamically
-    kmeans = KMeans(n_clusters=5, random_state=42)
+    kmeans = KMeans(n_clusters=5, random_state=42, n_init=10)
     clusters = kmeans.fit_predict(latent_feats)
-    
+
+    # --- Train Cluster Experts ---
     experts = {}
     sample_to_expert = {}
-    
-    unique_clusters = np.unique(clusters)
-    for c in unique_clusters:
+    base_state = copy.deepcopy(base_model.state_dict())
+
+    for c in np.unique(clusters):
         idx = np.where(clusters == c)[0]
-        
-        # Train Shard
         m = MLP().to(device)
-        m.load_state_dict(base_model.state_dict())
-        
+        m.load_state_dict(base_state)
+
         Xc = X_t[idx]
         yc = y_t[idx]
         c_pids = [patient_ids[i] for i in idx]
-        
+
         for p_id in c_pids:
-            sample_to_expert[p_id] = c
-            
-        train_model(m, Xc, yc, epochs=15)
+            sample_to_expert[p_id] = int(c)
+
+        train_model(m, Xc, yc, epochs=8)
         m.eval()
-        
-        experts[c] = {
+
+        experts[int(c)] = {
             "model": m,
-            "global_idx": idx.tolist(), 
+            "global_idx": idx.tolist(),
             "pids": c_pids,
             "fingerprint": get_model_fingerprint(m)
         }
-        
-    return experts, sample_to_expert, time.time() - start_time, kmeans, clusters
+
+    # --- Measure full retrain baseline ---
+    t0 = time.time()
+    bench = MLP().to(device)
+    train_model(bench, X_t, y_t, epochs=10)
+    full_retrain_baseline = time.time() - t0
+
+    return {
+        "experts": experts,
+        "sample_to_expert": sample_to_expert,
+        "kmeans": kmeans,
+        "clusters": clusters,
+        "X_t": X_t,
+        "y_t": y_t,
+        "feature_names": feature_names,
+        "target_names": target_names,
+        "patient_ids": patient_ids,
+        "df_raw": df,
+        "scaler": scaler,
+        "full_retrain_baseline": full_retrain_baseline,
+    }
 
 def ensemble_predict(experts_dict, x_tensor):
     preds = []
@@ -155,30 +170,25 @@ def ensemble_predict(experts_dict, x_tensor):
 # ============================
 def init_state():
     if "initialized" not in st.session_state:
-        seed_everything()
-        X_t, y_t, f_names, p_ids, t_names, X_scaled, df_raw, scaler = load_and_preprocess_data()
-        
-        st.session_state.feature_names = f_names
-        st.session_state.target_names = t_names
-        st.session_state.p_ids = p_ids
-        st.session_state.X_t = X_t
-        st.session_state.y_t = y_t
-        st.session_state.df_raw = df_raw
-        st.session_state.scaler = scaler
-        
-        with st.spinner("Compiling ADISA Engine (Base Training -> Latent Ext -> KMeans -> Shards)..."):
-            exp, s2e, ttime, kmeans_model, cluster_assignments = init_sisa_clusters(X_t, y_t, p_ids)
-            st.session_state.full_retrain_baseline = train_full_model_time(X_t, y_t)
-            
-        st.session_state.experts = exp
-        st.session_state.sample_to_expert = s2e
-        st.session_state.kmeans = kmeans_model
-        st.session_state.clusters = cluster_assignments
-        st.session_state.baseline_time = ttime
-        
+        engine = build_engine()
+
+        # Copy mutable structures into session_state so they can be modified
+        st.session_state.experts = engine["experts"]
+        st.session_state.sample_to_expert = dict(engine["sample_to_expert"])
+        st.session_state.kmeans = engine["kmeans"]
+        st.session_state.clusters = engine["clusters"]
+        st.session_state.X_t = engine["X_t"]
+        st.session_state.y_t = engine["y_t"]
+        st.session_state.feature_names = engine["feature_names"]
+        st.session_state.target_names = engine["target_names"]
+        st.session_state.p_ids = engine["patient_ids"]
+        st.session_state.df_raw = engine["df_raw"]
+        st.session_state.scaler = engine["scaler"]
+        st.session_state.full_retrain_baseline = engine["full_retrain_baseline"]
+
         st.session_state.audit_logs = []
         st.session_state.unlearn_events = []
-        
+
         st.session_state.metrics = {
             "version": "v2.0.0-pima-adisa",
             "val_accuracy": 0.81,
@@ -189,7 +199,7 @@ def init_state():
             "total_deletions": 0,
             "flagged_cases": 0
         }
-        
+
         st.session_state.initialized = True
         log_event("System", "Initialization", None, "PIMA Diabetes ADISA Sharded System booted.")
 
@@ -208,23 +218,23 @@ def log_event(user, action, p_id, desc):
 # ============================
 def view_classifier():
     st.header("Workspace: PIMA Diabetes Classifier")
-    st.markdown("Run inferences using the ADISA Latent Shard Ensemble. You can select an existing patient, or alter their metrics to simulate a new diagnosis.")
-    
+    st.markdown("Run inferences using the ADISA Latent Shard Ensemble. Select an existing patient or alter their metrics.")
+
     active_pids = list(st.session_state.sample_to_expert.keys())
     if not active_pids:
         st.error("No active patients available.")
         return
-        
+
     c1, c2 = st.columns([1, 1])
-    
+
     with c1:
         selected_pid = st.selectbox("Select Active Patient Record", active_pids)
         g_idx = st.session_state.p_ids.index(selected_pid)
         raw_row = st.session_state.df_raw.iloc[g_idx]
-        
+
         with st.form("metric_form"):
             st.markdown("**Clinical Observations**")
-            
+
             c_a, c_b = st.columns(2)
             preg = c_a.number_input("Pregnancies", value=float(raw_row["Pregnancies"]))
             glu = c_b.number_input("Glucose", value=float(raw_row["Glucose"]))
@@ -234,27 +244,25 @@ def view_classifier():
             bmi = c_b.number_input("BMI", value=float(raw_row["BMI"]))
             dpf = c_a.number_input("Diabetes Pedigree", value=float(raw_row["DiabetesPedigree"]))
             age = c_b.number_input("Age", value=float(raw_row["Age"]))
-            
+
             submitted = st.form_submit_button("Run Diabetics Diagnosis via Shard Ensemble", type="primary")
-            
+
             if submitted:
-                # Custom input prediction
                 inp = np.array([[preg, glu, bp, skin, ins, bmi, dpf, age]])
                 inp_scaled = st.session_state.scaler.transform(inp)
                 x_tensor = torch.tensor(inp_scaled, dtype=torch.float32)
-                
-                with st.spinner("Analyzing neural latent topology..."):
-                    pred, conf = ensemble_predict(st.session_state.experts, x_tensor)
-                    pred_label = st.session_state.target_names[pred]
-                    
-                    st.session_state.last_pred = {
-                        "pid": selected_pid, 
-                        "pred": pred_label, 
-                        "conf": conf,
-                        "cluster": st.session_state.sample_to_expert[selected_pid]
-                    }
-                    log_event("Dr. User", "Diagnosis", selected_pid, f"Predicted {pred_label} with {conf:.2%} confidence.")
-                    
+
+                pred, conf = ensemble_predict(st.session_state.experts, x_tensor)
+                pred_label = st.session_state.target_names[pred]
+
+                st.session_state.last_pred = {
+                    "pid": selected_pid,
+                    "pred": pred_label,
+                    "conf": conf,
+                    "cluster": st.session_state.sample_to_expert.get(selected_pid, "N/A")
+                }
+                log_event("Dr. User", "Diagnosis", selected_pid, f"Predicted {pred_label} with {conf:.2%} confidence.")
+
     with c2:
         if "last_pred" in st.session_state and st.session_state.last_pred.get("pid") == selected_pid:
             p = st.session_state.last_pred
@@ -262,7 +270,7 @@ def view_classifier():
             st.metric("Predicted Condition", "🚨 Diabetic" if p['pred']=="Diabetic" else "✅ Negative")
             st.progress(p['conf'], text=f"Ensemble Confidence: {p['conf']:.2%}")
             st.info(f"Primary Latent Cluster Affinity: **Cluster {p['cluster']}**")
-            
+
             st.divider()
             st.markdown("### Clinical Peer Review")
             flagged = st.toggle("Flag for Board Review")
@@ -277,23 +285,23 @@ def view_classifier():
 
 def view_unlearning():
     st.header("ADISA Latent Machine Unlearning (HIPAA)")
-    st.markdown("Selectively purge a patient. The system will locate their assigned K-Means cluster and exclusively retrain that sub-network.")
-    
+    st.markdown("Selectively purge a patient. The system locates their K-Means cluster and exclusively retrains that sub-network.")
+
     pid_str = st.text_input("Enter Patient ID to revoke (e.g. P-1045):")
-    
+
     if pid_str:
         if pid_str in st.session_state.sample_to_expert:
             exp_id = st.session_state.sample_to_expert[pid_str]
             st.success(f"Patient {pid_str} mapped to Latent Cluster {exp_id}.")
-            
+
             with st.form("unlearn_form"):
                 st.markdown("**Compliance Checklist**")
                 requester = st.text_input("Requesting Officer", value="Compliance Bot")
-                reason = st.selectbox("Reason for Deletion", ["HIPAA Erasure", "Model Toxicity Reset"])
+                reason = st.selectbox("Reason for Deletion", ["HIPAA Erasure", "GDPR Right to Erasure", "Consent Revoked", "Data Sourcing Error"])
                 consent = st.checkbox("I authorize deep topological unlearning.", value=False)
-                
+
                 submitted = st.form_submit_button("Execute Sub-Shard Retraining")
-                
+
                 if submitted:
                     if not consent:
                         st.error("Operation aborted. Check the consent box.")
@@ -301,26 +309,22 @@ def view_unlearning():
                         with st.spinner(f"Severing {pid_str} from Cluster {exp_id} network..."):
                             start_time = time.time()
                             exp = st.session_state.experts[exp_id]
-                            
-                            # Filter using PIDs
+
                             local_idx = exp["pids"].index(pid_str)
-                            
-                            # Grab global indices, filter it
+
                             global_indices = exp["global_idx"]
                             keep_global = [i for i in global_indices if i != global_indices[local_idx]]
-                            
+
                             new_pids = [exp["pids"][i] for i in range(len(exp["pids"])) if i != local_idx]
-                            
-                            # Use global tensors
+
                             new_X = st.session_state.X_t[keep_global]
                             new_y = st.session_state.y_t[keep_global]
-                            
-                            # Retrain shard
+
                             new_m = MLP().to(device)
                             if len(new_X) > 0:
-                                train_model(new_m, new_X, new_y, epochs=15)
+                                train_model(new_m, new_X, new_y, epochs=8)
                             new_m.eval()
-                            
+
                             st.session_state.experts[exp_id] = {
                                 "model": new_m,
                                 "global_idx": keep_global,
@@ -328,22 +332,20 @@ def view_unlearning():
                                 "fingerprint": get_model_fingerprint(new_m)
                             }
                             del st.session_state.sample_to_expert[pid_str]
-                            
+
                             u_time = time.time() - start_time
                             f_time = st.session_state.full_retrain_baseline
-                            
-                            # Update metrics
+
                             old_acc = st.session_state.metrics["val_accuracy"]
                             new_acc = old_acc - random.uniform(-0.002, 0.005)
-                            
+
                             st.session_state.metrics["val_accuracy"] = new_acc
                             st.session_state.metrics["total_deletions"] += 1
                             st.session_state.metrics["avg_unlearn_time"] = u_time
-                            
-                            # Log
+
                             log_desc = f"Erased {pid_str}. K-Means Shard {exp_id} surgically retrained in {u_time:.2f}s."
                             log_event(requester, "Data Purged", pid_str, log_desc)
-                            
+
                             st.session_state.unlearn_events.append({
                                 "timestamp": datetime.now().strftime("%H:%M:%S"),
                                 "patient_id": pid_str,
@@ -353,7 +355,7 @@ def view_unlearning():
                                 "old_acc": old_acc,
                                 "new_acc": new_acc
                             })
-                            
+
                             st.session_state.last_unlearn = st.session_state.unlearn_events[-1]
                             st.rerun()
         else:
@@ -369,14 +371,14 @@ def view_unlearning():
 
 def view_monitoring():
     st.header("Verification & Monitoring")
-    
+
     m = st.session_state.metrics
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("K-Means Shards", "5 Clusters")
     k2.metric("Total HIPAA Deletions", m["total_deletions"])
     k3.metric("Last Unlearn Latency", f"{m['avg_unlearn_time']:.3f}s")
     k4.metric("Flagged Anomalies", m["flagged_cases"])
-    
+
     st.divider()
     c1, c2 = st.columns(2)
     with c1:
@@ -387,7 +389,7 @@ def view_monitoring():
         })
         fig1 = px.bar(df_m, x="Metric", y="Score", range_y=[0.6, 1.0], color="Metric")
         st.plotly_chart(fig1, use_container_width=True)
-        
+
     with c2:
         st.subheader("ADISA Latency Analysis")
         if st.session_state.unlearn_events:
@@ -401,11 +403,11 @@ def view_monitoring():
 
 def view_audit():
     st.header("HIPAA Compliance Audit Trail")
-    
+
     if not st.session_state.audit_logs:
         st.info("No compliance logs available.")
         return
-        
+
     df = pd.DataFrame(st.session_state.audit_logs)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -415,7 +417,7 @@ def view_audit():
 def main():
     st.sidebar.title("🏥 ADISA Framework")
     init_state()
-        
+
     page = st.sidebar.radio("Navigation", [
         "🔍 Diagnostic Workspace",
         "🧪 Patient Unlearning Lab",
@@ -423,7 +425,7 @@ def main():
         "📋 HIPAA Audit Ledger"
     ])
     st.sidebar.caption("PIMA Diabetes KMeans Sharded Architecture")
-    
+
     if page == "🔍 Diagnostic Workspace":
         view_classifier()
     elif page == "🧪 Patient Unlearning Lab":
